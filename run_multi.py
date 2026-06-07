@@ -19,11 +19,12 @@ n = 200
 mcmc_iterations = 2000
 Run_Num = 1
 
+# d = 4,8,16,32 for synthetic dataset, d = 11 for sachs dataset
 for d in [11]:        
     ce_constraints_list = get_multi_ce_constraints(d)
-
     for name, ce_constraints in ce_constraints_list:
-        for structure_kernel in ["PARNI", "Structure_MCMC"]:
+        # structure_kernel = "PARNI" / "Structure_MCMC"
+        for structure_kernel in ["PARNI"]:
             results = []
             for num in [1]:
                 for run_num in range(1,Run_Num+1):

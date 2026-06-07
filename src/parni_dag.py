@@ -1,46 +1,18 @@
-# -*- coding: utf-8 -*-
-"""
-Minimal PARNI-DAG implementation (paper-faithful core only)
-
-This file is a *reduced* version derived from your parni_dag_2.py, keeping only:
-  - BGe score backend (same as long_multilevel_splitting_frame usage)
-  - Core PARNI-DAG neighborhood proposal (sample k, update_LA_DAG, MH ratio pieces)
-  - Optional Eq.(9) PIPs adaptation (Appendix B phi schedule)
-  - Optional Eq.(13) omega (neighborhood thinning) Robbins–Monro update
-  - The small interface required by long_multilevel_splitting_frame:
-      parni_prepare_context, parni_make_LA_from_G, parni_step_one, parni_update_pips_eq9
-
-Everything else (warm-start parent-set enumeration from skeleton H, g-prior backend,
-extra utilities/experiments) is intentionally removed to simplify debugging.
-
-Data orientation matches the R implementation:
-  X_p_n.shape == (p, n)  (rows = variables, cols = samples)
-"""
+"""PARNI-DAG proposal utilities used by the MLS samplers."""
 from __future__ import annotations
-
-import numpy as np
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Dict, List
-from collections import deque
+import numpy as np
 try:
     from src.bge import BGe  # type: ignore
 except Exception:  # pragma: no cover
     BGe = object  # type: ignore
 
 
-# =============================================================================
-# 1) BGe adapter + log marginal likelihood cache (node-wise decomposable)
-# =============================================================================
 class BGEAdapter:
-    """
-    Adapter for trust.utils.bge.BGe.
-
-    Assumptions:
-      - bge_obj.mll(G, X) computes the whole-graph log marginal likelihood.
-      - bge_obj._mll_per_variable(i, parents_vec, R, N) computes local mll for node i.
-      - Your data for BGe is (N, d). Internally we store (p, n) and transpose.
-    """
+    """Node-wise BGe score adapter for PARNI local updates."""
     def __init__(self, bge_obj: BGe, X_p_n: np.ndarray):
         assert X_p_n.ndim == 2
         self.p = int(X_p_n.shape[0])
@@ -55,16 +27,16 @@ class BGEAdapter:
 
 @dataclass
 class HyperPar:
-    X: np.ndarray                       # (p, n)
-    h: float | Tuple[float, float]      # edge prior (Bernoulli(h) or Beta-Binomial(a,b) on |E|)
+    X: np.ndarray
+    h: float | Tuple[float, float]
     p: int
     n: int
     max_p: int
-    log_llh: Callable                   # function(LA, hyper_par) -> LA
-    log_llh_update: Callable            # function(changes, LA_old, LA, hyper_par) -> LA
-    log_m_prior: Callable               # function(p_gam, h, max_p) -> float
-    tables: BGEAdapter                  # BGeAdapter (stores R, N)
-    XtX: Optional[np.ndarray] = None    # (p, p) cross-product for warm-start heuristics
+    log_llh: Callable
+    log_llh_update: Callable
+    log_m_prior: Callable
+    tables: BGEAdapter
+    XtX: Optional[np.ndarray] = None
 
 @dataclass
 class LAState:
@@ -73,7 +45,7 @@ class LAState:
     llh: float = 0.0
     lmp: float = 0.0
     log_post: float = 0.0
-    A: Optional[np.ndarray] = None      # per-node contributions
+    A: Optional[np.ndarray] = None
 
 def log_llh_BGE(LA: LAState, hyper_par: HyperPar) -> LAState:
     adapter: BGEAdapter = hyper_par.tables
@@ -92,7 +64,6 @@ def log_llh_BGE_update_table(changes: np.ndarray, LA_old: LAState, LA: LAState, 
     G = LA.curr
     p = hyper_par.p
 
-    # copy old cache; if missing, recompute from scratch
     if LA_old.A is None:
         A = np.zeros(p, dtype=float)
         for j in range(p):
@@ -105,7 +76,6 @@ def log_llh_BGE_update_table(changes: np.ndarray, LA_old: LAState, LA: LAState, 
     A = LA_old.A.copy()
     cols = np.unique(np.array(changes, dtype=int))
 
-    # tolerate R-style 1-based
     cols = np.array([c - 1 if (1 <= c <= p) else c for c in cols], dtype=int)
     cols = cols[(cols >= 0) & (cols < p)]
     for j in cols:
@@ -116,61 +86,29 @@ def log_llh_BGE_update_table(changes: np.ndarray, LA_old: LAState, LA: LAState, 
     LA.p_gam = int(G.sum())
     return LA
 
-# =============================================================================
-# 2) DAG utilities
-# =============================================================================
 def has_path(G: np.ndarray, start_node: int, end_node: int, exclude_edge: Optional[Tuple[int, int]] = None) -> bool:
-    """
-    使用 BFS 快速检查是否存在从 start_node 到 end_node 的路径。
-    用于替代全图 Kahn 算法。
-    """
+    """Return whether a directed path exists from start_node to end_node."""
     if start_node == end_node:
         return True
-        
     d = G.shape[0]
     visited = np.zeros(d, dtype=bool)
     queue = deque([start_node])
     visited[start_node] = True
-    
     ex_u, ex_v = (-1, -1) if exclude_edge is None else exclude_edge
-
     while queue:
         curr = queue.popleft()
-        # 找出所有子节点
         children = np.where(G[curr, :] == 1)[0]
-        
         for child in children:
-            # 如果这条边是被“排除”的（用于翻转检测），则跳过
             if curr == ex_u and child == ex_v:
                 continue
-            
             if child == end_node:
                 return True
-            
             if not visited[child]:
                 visited[child] = True
                 queue.append(child)
     return False
 
-def is_valid_move_incremental(G: np.ndarray, i: int, j: int, move_type: str) -> bool:
-    """
-    基于当前图 G，判断对边 (i, j) 进行操作是否合法。
-    move_type: 'add' (加边 i->j), 'del' (删边), 'rev' (翻转 i->j 为 j->i)
-    """
-    if move_type == 'del':
-        return True
-    
-    if move_type == 'add':
-        # 如果要加 i->j，必须保证没有 j->...->i 的路径
-        return not has_path(G, start_node=j, end_node=i)
-        
-    if move_type == 'rev':
-        # 如果要翻转 i->j 为 j->i，相当于：先删 i->j，再加 j->i。
-        # 需要检查是否存在 i->...->j 的路径（不走直连边）
-        return not has_path(G, start_node=i, end_node=j, exclude_edge=(i, j))
-        
-    return False
-    
+
 def sample_ind_DAG(
     whe_sam: bool,
     probs: np.ndarray,
@@ -178,21 +116,13 @@ def sample_ind_DAG(
     log: bool = False,
     rng: Optional[np.random.Generator] = None,
 ):
-    """
-    Sample k ~ Bernoulli(probs) entrywise over directed edges using *F-order* flattening
-    to match the original R encoding: idx = i + d*j (i->j).
-
-    Returns:
-      {"prob": log p(k) if log=True else p(k), "sample": samples_idx}
-    """
+    """Sample selected directed-edge indices using Fortran-order flattening."""
     if rng is None:
         rng = np.random.default_rng()
-
     d = probs.shape[0]
     if whe_sam:
         draws = (rng.random((d, d)) < probs).astype(int)
         samples = np.where(draws.ravel(order="F") == 1)[0]
-
     if log:
         if samples is None or samples.size == 0:
             prob = 0.0
@@ -207,9 +137,7 @@ def sample_ind_DAG(
             prob = float(np.prod(flat[samples]))
     return {"prob": prob, "sample": samples}
 
-# =============================================================================
-# 3) Priors and LA construction
-# =============================================================================
+# Priors and LA construction
 def _log_m_prior_beta_binom(p_gam: int, hval, mp: int) -> float:
     """
     Prior over number of edges |E| (up to additive constant):
@@ -235,9 +163,7 @@ def compute_LA_DAG(gamma: np.ndarray, hyper_par: HyperPar) -> LAState:
     LA.log_post = LA.llh + log_m_prior
     return LA
 
-# =============================================================================
-# 4) Core PARNI neighborhood update (update_LA_DAG)
-# =============================================================================
+# Core PARNI neighborhood update (update_LA_DAG)
 def _get_moves() -> np.ndarray:
     # (0,0), (1,0), (0,1), (1,1)
     return np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=int)
@@ -263,13 +189,11 @@ def update_LA_DAG(
 ):
     """
     One informed sub-proposal sequence over the neighborhood indices in k.
-
     This is a log-domain implementation of the R code:
       - groups (i->j, j->i) pairs if both present in k
       - for each group, enumerate local candidate graphs (2 or 4 states)
       - weight by Hastings balancing function g(x)=min(1,x) (log_g = min(0, L))
       - sample a local move and accumulate log q forward/reverse and normalization constants
-
     Returns dict with:
       LA_prop, prob_prop, rev_prob_prop, prod_bal_con, rev_prod_bal_con, thinned_k_size, ...
     """
@@ -340,10 +264,8 @@ def update_LA_DAG(
     omega_thin = float(np.clip(thinning_rate, 0.0, 1.0))
     total_k_size = int(len(grouped))
     n_eval = 0
-
     M = _get_moves()
     JD = 0
-
     prob_prop_log = 0.0
     rev_prob_prop_log = 0.0
     prod_bal_con_log = 0.0
@@ -354,7 +276,6 @@ def update_LA_DAG(
         if rng.random() >= omega_thin:
             continue
         n_eval += 1
-
         kj, kj_swap = grouped[idx]
         kj = int(kj)
         has_swap = kj_swap is not None
@@ -475,8 +396,9 @@ def update_LA_DAG(
         L_rel = L_move - L_move[chosen]
         rev_log_w = np.minimum(0.0, L_rel)
         rev_bal_const_log = _logsumexp(rev_log_w)
-
-        rev_prob_prop_log += float(rev_log_w[0])          # probability to go back to base (keep)
+        
+        # probability to go back to base (keep)
+        rev_prob_prop_log += float(rev_log_w[0])         
         rev_prod_bal_con_log += float(-rev_bal_const_log)
 
     return dict(
@@ -492,9 +414,7 @@ def update_LA_DAG(
         rev_prod_bal_con=float(rev_prod_bal_con_log),
     )
 
-# =============================================================================
-# 5) Omega thinning (paper §3.4 Eq.(13)) and PIPs adaptation (paper §3.2 Eq.(9))
-# =============================================================================
+# Omega thinning and PIPs adaptation
 def logit_e(x: np.ndarray, eps: float) -> np.ndarray:
     x = x.copy()
     x[x > 1 - 2 * eps] = 1 - 2 * eps
@@ -512,7 +432,7 @@ def _inv_logit_e_scalar(y: float, eps: float) -> float:
     return float(inv_logit_e(np.array([float(y)], dtype=float), eps)[0])
 
 def _omega_robbins_monro_update(ctx: dict, Nt: int) -> None:
-    """Paper §3.4 Eq.(13) Robbins–Monro update for omega thinning."""
+    """Robbins-Monro update for omega thinning."""
     if not bool(ctx.get("omega_adapt", False)):
         return
     try:
@@ -561,7 +481,6 @@ def _phi_schedule_S8(t: int, Nb: int) -> float:
 def _recompute_AD_from_PIPs(PIPs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     A_ij = min(P/(1-P), 1), D_ij = min((1-P)/P, 1)
-    (matches the paper's behavior example in §3.2 and your original parni_dag_2 implementation)
     """
     P = np.asarray(PIPs, dtype=float)
     A = np.minimum(P / np.maximum(1e-12, 1.0 - P), 1.0)
@@ -572,8 +491,8 @@ def _recompute_AD_from_PIPs(PIPs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 def parni_update_pips_eq9(ctx: dict, G_curr: np.ndarray) -> dict:
     """
-    Paper §3.2 Eq.(9) adaptive update for η / PIPs.
-    Call AFTER outer MH accept/reject, using the chain's current graph γ^{(t)}.
+    adaptive update for η / PIPs.
+    Call AFTER outer MH accept/reject, using the chain's current graph.
     """
     if not bool(ctx.get("pips_adapt", True)):
         return {"enabled": False}
@@ -621,10 +540,7 @@ def parni_update_pips_eq9(ctx: dict, G_curr: np.ndarray) -> dict:
         "max_pips": float(np.max(eta_hat[mask])),
     }
 
-
-# =============================================================================
-# 5.5) Paper §3.2 warm-start: approximate oriented PIPs from skeleton H (BGe)
-# =============================================================================
+# warm-start: approximate oriented PIPs from skeleton H (BGe)
 def _local_log_prior_size(s: int, m: int, hval) -> float:
     """Local prior over parent-set size s (m = p-1). Supports Bernoulli(h) and Beta-Binomial(a,b).
     Note: constants that do not depend on s are dropped (as in the original code) since we only
@@ -639,7 +555,8 @@ def _local_log_prior_size(s: int, m: int, hval) -> float:
     return float(s * math.log(h) + (m - s) * math.log(1.0 - h))
 
 def _iter_subsets(cand_idx, max_enum: Optional[int] = None):
-    """Enumerate subsets of cand_idx. If 2^m exceeds max_enum, enumerate all small subsets first,
+    """
+    Enumerate subsets of cand_idx. If 2^m exceeds max_enum, enumerate all small subsets first,
     then randomly sample additional subsets to reach budget (paper-inspired practical guard).
     """
     cand_idx = list(int(x) for x in cand_idx)
@@ -679,15 +596,14 @@ def paper_marPIPs_from_H(
     max_enum_sets: int = 4096,
     extra_parents: Optional[Dict[int, List[int]]] = None,
 ) -> np.ndarray:
-    """Paper §3.2 warm-start: approximate oriented edge PIPs from a skeleton H using BGe local scores.
-
-    This is a faithful, *practical* version:
+    """
+    warm-start: approximate oriented edge PIPs from a skeleton H using BGe local scores.
+    This is a faithful, practical version:
       - per-node parent-set enumeration restricted by H[:, j]
       - optional one-step expansion (h_j^+) by adding 1 strong outside candidate
       - truncate very large candidate sets to max_enum_parents using |XtX| heuristic
       - convert marginal (parent inclusion) probabilities to oriented edge probabilities with mutual exclusion
       - apply kappa shrinkage toward 0.5 to avoid extreme PIPs
-
     Returns:
       PIPs (p,p) oriented, diagonal = 0.
     """
@@ -697,40 +613,29 @@ def paper_marPIPs_from_H(
         raise ValueError(f"H must have shape {(p, p)}, got {H.shape}")
     H = (H != 0).astype(int)
     np.fill_diagonal(H, 0)
-
-    # We rely on BGeAdapter for local scores.
     adapter: BGEAdapter = hp.tables
     if adapter is None:
         raise ValueError("paper_marPIPs_from_H requires hp.tables (BGEAdapter).")
-
-    # correlation / relevance heuristic for truncation
     XtX = hp.XtX
     if XtX is None:
         X = np.asarray(hp.X, dtype=float)
         XtX = X @ X.T
     XtX = np.asarray(XtX, dtype=float)
-
-    P_raw = np.zeros((p, p), dtype=float)  # marginal parent inclusion (not oriented yet)
-
+    P_raw = np.zeros((p, p), dtype=float)
     for j in range(p):
         cand = np.where(H[:, j] == 1)[0]
         cand = cand[cand != j]
         if cand.size == 0:
             continue
-
-        # truncate too-large candidate parent sets by absolute cross-correlation
         if cand.size > int(max_enum_parents):
             wj = np.abs(XtX[cand, j])
             take = np.argsort(-wj)[: int(max_enum_parents)]
             cand = cand[take]
-
         subsets = list(_iter_subsets(cand, max_enum=int(max_enum_sets)))
-
-        # optional h_j^+ expansion: add 1 outside candidate to compare (paper)
         if extend_one:
             outside = np.setdiff1d(np.arange(p), np.append(cand, j))
             if outside.size > 0:
-                # Appendix C: h_j^+ uses one extra parent candidate outside skeleton.
+                # h_j^+ uses one extra parent candidate outside skeleton.
                 # Prefer user-provided extra_parents[j] if available; otherwise fall back to XtX heuristic.
                 keep_o = None
                 if extra_parents is not None and int(j) in extra_parents and extra_parents[int(j)]:
@@ -795,9 +700,8 @@ def paper_marPIPs_from_H(
         np.fill_diagonal(P, 0.0)
 
     return P
-# =============================================================================
-# 6) Public interface for long_multilevel_splitting_frame
-# =============================================================================
+
+# Public interface for long_multilevel_splitting_frame
 def parni_prepare_context(
     X_p_n: np.ndarray,
     h,
@@ -811,8 +715,7 @@ def parni_prepare_context(
     extra_parents: Optional[Dict[int, List[int]]] = None,  # Appendix C h_j^+ outside candidates
 ) -> dict:
     """
-    Build a minimal PARNI context. For simplicity, we always initialize PIPs uniformly at 0.5
-    (except diagonal), which is sufficient for correctness; warm-start enumeration from H is removed.
+    Build a minimal PARNI context.
     """
     X_p_n = np.asarray(X_p_n, dtype=float)
     p, n = X_p_n.shape
@@ -840,7 +743,7 @@ def parni_prepare_context(
     # Initialize PIPs
     pips_mode_req = str(pips_mode).lower()
     if pips_mode_req == "bge":
-        # Use paper §3.2 warm-start from skeleton H and BGe local scores
+        #  warm-start from skeleton H and BGe local scores
         if H is None:
             H_eff = np.ones((p, p), dtype=int) - np.eye(p, dtype=int)
         else:
@@ -883,7 +786,6 @@ def parni_prepare_context(
         PIPs=np.array(PIPs, copy=True, dtype=float),
         A=A,
         D=D,
-        # Eq.(9) state
         pi_tilde=np.array(PIPs, copy=True, dtype=float),
         pi_hat=np.zeros_like(PIPs, dtype=float),
         pips_adapt=True,
@@ -893,7 +795,7 @@ def parni_prepare_context(
         # omega thinning
         omega=float(omega),
         omega_thin=float(omega),
-        omega_adapt=False,       # paper feature; default off in minimal build
+        omega_adapt=False,     
         omega_t=0,
         omega_eps=1e-6,
         omega_rm_gamma=0.7,
